@@ -232,6 +232,21 @@
             </div>
         </header>
 
+        <!-- Admin-only confirmed booking import; excluded from printed invoice -->
+        <section class="no-print max-w-5xl mx-auto px-3 sm:px-5 pt-3">
+            <div class="bg-amber-50 border border-amber-300 rounded-xl p-3 sm:p-4">
+                <div class="font-extrabold text-sm text-[#071326]">Load Confirmed Booking</div>
+                <p class="text-xs text-slate-600 mt-1">Choose a confirmed booking to fill in the passenger, contact, route, date and trip details automatically. You will still enter the fare.</p>
+                <div class="flex flex-col sm:flex-row gap-2 mt-3">
+                    <select id="confirmedBookingSelect" class="min-w-0 flex-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm text-slate-800">
+                        <option value="">Loading confirmed bookings…</option>
+                    </select>
+                    <button type="button" onclick="loadConfirmedBookingIntoInvoice()" class="rounded-lg bg-[#071326] px-4 py-2.5 text-sm font-extrabold text-amber-300">Load Booking Details</button>
+                </div>
+                <p id="confirmedBookingPickerNote" class="text-xs text-slate-500 mt-2">Only confirmed bookings without an existing invoice are listed.</p>
+            </div>
+        </section>
+
         <!-- A4 Printable Invoice Sheet -->
         <div class="sheet-scroll-wrap">
             <main class="a4-sheet rounded-lg" id="invoiceSheet">
@@ -732,6 +747,8 @@
         // Change logs for current session & synced back-end store
         let sessionLogs = [];
         let allSyncedInvoices = [];
+        let allConfirmedBookings = [];
+        let confirmedBookingsUnsubscribe = null;
         let selectedAdminInvoiceId = null;
         const fieldBaseline = new Map();
 
@@ -779,6 +796,7 @@
                         document.getElementById('adminPinModal').classList.add('hidden');
                         updateCloudPill(true, 'Admin Cloud Synced');
                         subscribeToInvoicesCollection();
+                        subscribeToConfirmedBookings();
                         enterAdminPortal();
                     } else {
                         updateCloudPill(false, 'Admin login required');
@@ -888,6 +906,110 @@
             }
         }
 
+        // Read confirmed bookings from the same private Firebase collection used by the booking dashboard.
+        function subscribeToConfirmedBookings() {
+            if (!db || !currentUser || currentUser.isAnonymous) return;
+            if (confirmedBookingsUnsubscribe) confirmedBookingsUnsubscribe();
+            const colRef = collection(db, 'artifacts', appId, 'public', 'data', 'kdm_bookings');
+            confirmedBookingsUnsubscribe = onSnapshot(colRef, (snapshot) => {
+                const list = [];
+                snapshot.forEach((docSnap) => {
+                    const booking = docSnap.data() || {};
+                    if (String(booking.status || '').trim().toLowerCase() === 'confirmed' && booking.bookingRef) list.push(booking);
+                });
+                list.sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+                allConfirmedBookings = list;
+                renderConfirmedBookingPicker();
+            }, (err) => {
+                console.error('Confirmed bookings listener error:', err);
+                const note = document.getElementById('confirmedBookingPickerNote');
+                if (note) note.textContent = 'Could not load confirmed bookings. Check the Firebase connection and permissions.';
+            });
+        }
+
+        function renderConfirmedBookingPicker() {
+            const select = document.getElementById('confirmedBookingSelect');
+            const note = document.getElementById('confirmedBookingPickerNote');
+            if (!select) return;
+            const previous = select.value;
+            const alreadyInvoiced = new Set(allSyncedInvoices.map(inv => String(inv.bookingRef || '').trim().toUpperCase()).filter(Boolean));
+            const available = allConfirmedBookings.filter(b => !alreadyInvoiced.has(String(b.bookingRef || '').trim().toUpperCase()));
+            select.innerHTML = '';
+            const placeholder = document.createElement('option');
+            placeholder.value = '';
+            placeholder.textContent = available.length ? 'Select a confirmed booking…' : 'No un-invoiced confirmed bookings';
+            select.appendChild(placeholder);
+            available.forEach((booking) => {
+                const option = document.createElement('option');
+                option.value = booking.bookingRef;
+                option.textContent = `${booking.bookingRef} — ${booking.passengerName || 'Passenger'} — ${booking.pickupDate || 'Date not set'}`;
+                select.appendChild(option);
+            });
+            if (available.some(b => b.bookingRef === previous)) select.value = previous;
+            if (note) note.textContent = available.length
+                ? `${available.length} confirmed booking(s) available. Bookings already linked to an invoice are excluded.`
+                : 'Only confirmed bookings without an existing invoice are listed.';
+        }
+
+        window.loadConfirmedBookingIntoInvoice = async function() {
+            if (!db || !currentUser || currentUser.isAnonymous) { showToast('Please sign in as administrator first.'); return; }
+            const select = document.getElementById('confirmedBookingSelect');
+            const bookingRef = String(select?.value || '').trim();
+            if (!bookingRef) { showToast('Select a confirmed booking first.'); return; }
+            const booking = allConfirmedBookings.find(b => String(b.bookingRef || '') === bookingRef);
+            if (!booking || String(booking.status || '').trim().toLowerCase() !== 'confirmed') {
+                showToast('This booking is not currently confirmed. Refresh the booking status and try again.');
+                return;
+            }
+            if (!currentInvoiceDocId || currentInvoiceStatus !== 'Draft') {
+                showToast('Create a new invoice draft first, then load the confirmed booking.');
+                return;
+            }
+            if ((document.getElementById('invoiceNumber')?.innerText || '').trim()) {
+                showToast('This invoice already has a number. Create a new draft for another booking.');
+                return;
+            }
+            const existingRef = (document.getElementById('bookingRef')?.innerText || '').trim();
+            const existingName = (document.getElementById('clientName')?.innerText || '').trim();
+            if ((existingRef || (existingName && existingName !== 'Client / Passenger Name')) &&
+                !confirm('Replace the current draft details with the selected confirmed booking?')) return;
+
+            const safe = (v, fallback = '') => String(v == null || v === '' ? fallback : v);
+            const route = `${safe(booking.pickupLocation, 'Pickup not provided')} to ${safe(booking.dropoffLocation, 'Drop-off not provided')}`;
+            const tripParts = [
+                safe(booking.serviceType, 'Shuttle service'),
+                safe(booking.tripType, 'Trip'),
+                route,
+                `Pickup: ${safe(booking.pickupDate, booking.pickupDateRaw || 'Date not provided')} at ${safe(booking.pickupTime, 'Time not provided')}`
+            ];
+            if (String(booking.tripType || '').toLowerCase().includes('return')) {
+                tripParts.push(`Return: ${safe(booking.returnDate, 'Date not provided')} at ${safe(booking.returnTime, 'Time not provided')}`);
+            }
+            tripParts.push(`Passengers: ${safe(booking.passengerCount, 'Not specified')}`);
+            tripParts.push(`Luggage: ${safe(booking.luggageCount, 'Not specified')}`);
+            if (booking.specialNotes && booking.specialNotes !== 'None') tripParts.push(`Notes: ${booking.specialNotes}`);
+
+            document.getElementById('bookingRef').textContent = booking.bookingRef;
+            document.getElementById('clientName').textContent = safe(booking.passengerName, 'Passenger name not provided');
+            document.getElementById('clientAddress').textContent = 'Billing address not provided with booking';
+            document.getElementById('clientContact').textContent = [booking.passengerPhone, booking.passengerEmail && booking.passengerEmail !== 'Not provided' ? booking.passengerEmail : ''].filter(Boolean).join(' • ') || 'Contact details not provided';
+            document.getElementById('serviceScope').textContent = tripParts.join(' | ');
+            document.getElementById('invoiceNumber').textContent = '';
+            document.getElementById('bankPaymentRef').textContent = '';
+            document.getElementById('allocateInvoiceNumberBtn').classList.remove('hidden');
+            currentInvoiceBookingLinked = true;
+            shuttleItems = [{
+                id: Date.now(),
+                description: `${safe(booking.serviceType, 'Shuttle service')} — ${route}; ${safe(booking.pickupDate, booking.pickupDateRaw || 'Date not provided')} at ${safe(booking.pickupTime, 'Time not provided')}${String(booking.tripType || '').toLowerCase().includes('return') ? `; Return ${safe(booking.returnDate, '')} at ${safe(booking.returnTime, '')}` : ''}`,
+                qty: Math.max(1, Number(booking.passengerCount) || 1),
+                rate: 0
+            }];
+            sessionLogs.unshift({ id: 'log_booking_import_' + Date.now(), actor: 'Administrator', timestamp: nowTimestamp(), field: 'Confirmed Booking Imported', oldValue: existingRef || '(empty draft)', newValue: `${booking.bookingRef} — ${safe(booking.passengerName, 'Passenger')}`, reviewed: true });
+            renderShuttleItems();
+            await syncInvoiceSnapshotToCloud('Confirmed Booking Details Imported');
+            showToast(`Booking ${booking.bookingRef} loaded. Enter the fare before allocating the invoice number.`);
+        };
+
         // Subscribe to real-time Firestore collection for Back-End Admin Portal
         function subscribeToInvoicesCollection() {
             if (!db || !currentUser || currentUser.isAnonymous) return;
@@ -900,6 +1022,7 @@
                 // Sort in JS memory by updatedAt descending (No Firestore orderBy used)
                 items.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
                 allSyncedInvoices = items;
+                renderConfirmedBookingPicker();
 
                 if (!selectedAdminInvoiceId && allSyncedInvoices.length > 0) {
                     selectedAdminInvoiceId = allSyncedInvoices[0].docId;
@@ -1123,7 +1246,9 @@
         window.allocateConfirmedBookingInvoiceNumber = async function() {
             if (!db || !currentUser || currentUser.isAnonymous) { showToast('Please sign in as administrator first.'); return; }
             const bookingRefValue = (document.getElementById('bookingRef')?.innerText || '').trim();
-            if (!bookingRefValue) { showToast('Enter the booking reference first. Only allocate a number for a confirmed booking.'); return; }
+            if (!bookingRefValue) { showToast('Load a confirmed booking before allocating an invoice number.'); return; }
+            const confirmedBooking = allConfirmedBookings.find(b => String(b.bookingRef || '').trim().toUpperCase() === bookingRefValue.toUpperCase() && String(b.status || '').trim().toLowerCase() === 'confirmed');
+            if (!confirmedBooking) { showToast('Invoice numbers can only be allocated to a booking currently marked Confirmed. Select it from Load Confirmed Booking.'); return; }
             if ((document.getElementById('invoiceNumber')?.innerText || '').trim()) { showToast('This invoice already has a number.'); return; }
             if (!confirm(`Allocate the next permanent invoice number to confirmed booking ${bookingRefValue}? This number will not be reused.`)) return;
             try {

@@ -677,9 +677,14 @@
                                 <h2 class="text-xs font-bold uppercase tracking-wider">Chronological Field-by-Field Change Log</h2>
                                 <p class="text-xs text-slate-300">Who/Role, timestamp, field name, old value, and new value</p>
                             </div>
-                            <button type="button" onclick="markSelectedInvoiceLogsReviewed()" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer">
-                                Mark All Reviewed
-                            </button>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <button id="deleteSelectedInvoiceLogsBtn" type="button" onclick="deleteSelectedInvoiceLogs()" class="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-semibold cursor-pointer">
+                                    Delete Change Log
+                                </button>
+                                <button type="button" onclick="markSelectedInvoiceLogsReviewed()" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold cursor-pointer">
+                                    Mark All Reviewed
+                                </button>
+                            </div>
                         </div>
                         <div id="adminChangeFeed" class="custom-scroll p-4 space-y-2.5 max-h-[420px] overflow-y-auto bg-slate-50/50"><p class="text-xs text-slate-400 text-center py-6">No field edits recorded on this invoice yet.</p></div>
                     </div>
@@ -719,6 +724,8 @@
         let vatEnabled = true;
         let currentInvoiceDocId = '';
         let currentInvoiceStatus = 'Draft';
+        // Sticky protection: once an invoice has a booking reference, it stays non-deletable.
+        let currentInvoiceBookingLinked = false;
         let shuttleItems = [];
 
         // Change logs for current session & synced back-end store
@@ -798,6 +805,8 @@
             const vatAmount = vatEnabled ? subtotal * 0.15 : 0;
             const totalDue = subtotal + vatAmount;
 
+            const bookingRefValue = getTxt('bookingRef');
+            if (bookingRefValue) currentInvoiceBookingLinked = true;
             const invNum = getTxt('invoiceNumber') || currentInvoiceDocId;
             // Sanitize document ID
             const safeDocId = invNum.replace(/[^a-zA-Z0-9_-]/g, '_') || 'KDM_INV_DEFAULT';
@@ -808,7 +817,8 @@
                 invoiceNumber: invNum,
                 issueDate: getTxt('invoiceDate'),
                 dueDate: getTxt('invoiceDueDate'),
-                bookingRef: getTxt('bookingRef'),
+                bookingRef: bookingRefValue,
+                bookingLinked: currentInvoiceBookingLinked || !!bookingRefValue,
                 clientName: getTxt('clientName'),
                 clientAddress: getTxt('clientAddress'),
                 clientContact: getTxt('clientContact'),
@@ -1086,7 +1096,7 @@
                     return next;
                 });
                 const invoiceNo = `KDM-INV-2026-${String(n).padStart(3,'0')}`;
-                currentInvoiceDocId = invoiceNo; currentInvoiceStatus = 'Draft'; vatEnabled = false;
+                currentInvoiceDocId = invoiceNo; currentInvoiceStatus = 'Draft'; currentInvoiceBookingLinked = false; vatEnabled = false;
                 sessionLogs = [{ id:'log_new_'+Date.now(), actor:'Administrator', timestamp:nowTimestamp(), field:'Invoice Created', oldValue:'(none)', newValue:invoiceNo, reviewed:true }];
                 shuttleItems = [{ id:Date.now(), description:'Shuttle service', qty:1, rate:0 }];
                 const today = new Date(), due = new Date(today); due.setDate(due.getDate()+7);
@@ -1463,6 +1473,11 @@
             }
         }
 
+        // Any invoice carrying a booking reference (including a cancelled booking) is a permanent record.
+        function isBookingLinkedInvoice(inv) {
+            return !!(inv && (inv.bookingLinked === true || String(inv.bookingRef || '').trim()));
+        }
+
         function renderAdminDashboard() {
             // Compute top metrics
             const totalInvoices = allSyncedInvoices.length;
@@ -1522,9 +1537,14 @@
             const selected = allSyncedInvoices.find(i => i.docId === selectedAdminInvoiceId) || allSyncedInvoices[0];
             if (selected) {
                 selectedAdminInvoiceId = selected.docId;
-                document.getElementById('deleteSelectedInvoiceBtn').classList.remove('hidden');
-                document.getElementById('deleteSelectedInvoiceBtn').textContent = String(selected.status || 'Draft').toLowerCase() === 'draft'
-                    ? 'Delete Draft' : 'Delete Test Invoice';
+                const deleteBtn = document.getElementById('deleteSelectedInvoiceBtn');
+                if (isBookingLinkedInvoice(selected)) {
+                    deleteBtn.classList.add('hidden');
+                } else {
+                    deleteBtn.classList.remove('hidden');
+                    deleteBtn.textContent = ['draft', 'edited'].includes(String(selected.status || 'Draft').trim().toLowerCase())
+                        ? 'Delete Draft' : 'Delete Test Invoice';
+                }
                 renderSelectedInvoiceDetails(selected);
             }
         }
@@ -1537,6 +1557,7 @@
             const inv = allSyncedInvoices.find(i => i.docId === selectedAdminInvoiceId);
             if (!inv) { showToast('Select an invoice first.'); return; }
             if (inv.docId === '__counter_2026') { showToast('The invoice numbering counter cannot be deleted here.'); return; }
+            if (isBookingLinkedInvoice(inv)) { showToast('Protected record: invoices linked to a booking cannot be deleted, even if the booking is later cancelled.'); return; }
 
             const invoiceNo = String(inv.invoiceNumber || inv.docId);
             const normalizedStatus = String(inv.status || 'Draft').trim().toLowerCase();
@@ -1560,6 +1581,7 @@ ${required}`);
                 if (currentInvoiceDocId === inv.docId) {
                     currentInvoiceDocId = '';
                     currentInvoiceStatus = 'Draft';
+                    currentInvoiceBookingLinked = false;
                     sessionLogs = [];
                     shuttleItems = [];
                 }
@@ -1577,6 +1599,55 @@ ${required}`);
         window.selectAdminInvoice = function(docId) {
             selectedAdminInvoiceId = docId;
             renderAdminDashboard();
+        };
+
+        window.deleteSelectedInvoiceLogs = async function() {
+            if (!db || !currentUser || currentUser.isAnonymous) {
+                showToast('Administrator sign-in is required to delete change logs.');
+                return;
+            }
+            const inv = allSyncedInvoices.find(i => i.docId === selectedAdminInvoiceId);
+            if (!inv) { showToast('Select an invoice first.'); return; }
+            if (isBookingLinkedInvoice(inv)) {
+                showToast('Protected audit history: logs for booking-linked invoices cannot be deleted.');
+                return;
+            }
+            const logs = parseLogsSafe(inv.logsJson);
+            if (!logs.length) { showToast('There are no change-log entries to delete.'); return; }
+            const invoiceNo = String(inv.invoiceNumber || inv.docId);
+            if (!confirm(`Permanently delete all ${logs.length} change-log entr${logs.length === 1 ? 'y' : 'ies'} for ${invoiceNo}? This is only allowed for unlinked draft/test invoices and cannot be undone.`)) return;
+            try {
+                const updated = { ...inv, logsJson: '[]', updatedAt: new Date().toISOString(), updatedAtReadable: nowTimestamp() };
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'kdm_invoices', inv.docId), updated, { merge: true });
+                const index = allSyncedInvoices.findIndex(item => item.docId === inv.docId);
+                if (index >= 0) allSyncedInvoices[index] = updated;
+                if (currentInvoiceDocId === inv.docId) sessionLogs = [];
+                renderAdminDashboard();
+                showToast(`Change log cleared for ${invoiceNo}. Invoice number and record remain.`);
+            } catch (err) {
+                console.error('Change-log deletion failed:', err);
+                showToast(err?.code === 'permission-denied' ? 'Firebase rules blocked this change.' : (err.message || 'Could not delete change log.'));
+            }
+        };
+
+        window.markSelectedInvoiceLogsReviewed = async function() {
+            if (!db || !currentUser || currentUser.isAnonymous) { showToast('Administrator sign-in is required.'); return; }
+            const inv = allSyncedInvoices.find(i => i.docId === selectedAdminInvoiceId);
+            if (!inv) { showToast('Select an invoice first.'); return; }
+            const logs = parseLogsSafe(inv.logsJson);
+            if (!logs.length) { showToast('There are no change-log entries to review.'); return; }
+            const updated = { ...inv, logsJson: JSON.stringify(logs.map(entry => ({ ...entry, reviewed: true }))), updatedAt: new Date().toISOString(), updatedAtReadable: nowTimestamp() };
+            try {
+                await setDoc(doc(db, 'artifacts', appId, 'public', 'data', 'kdm_invoices', inv.docId), updated, { merge: true });
+                const index = allSyncedInvoices.findIndex(item => item.docId === inv.docId);
+                if (index >= 0) allSyncedInvoices[index] = updated;
+                if (currentInvoiceDocId === inv.docId) sessionLogs = logs.map(entry => ({ ...entry, reviewed: true }));
+                renderAdminDashboard();
+                showToast('All change-log entries marked as reviewed.');
+            } catch (err) {
+                console.error('Review update failed:', err);
+                showToast(err?.code === 'permission-denied' ? 'Firebase rules blocked this update.' : (err.message || 'Could not update review status.'));
+            }
         };
 
         function renderSelectedInvoiceDetails(inv) {
@@ -1628,6 +1699,10 @@ ${required}`);
                     <strong class="text-[#92660e]">Notes on Invoice:</strong> ${escapeHtml(inv.shuttleTerms || '')}
                 </div>
             `;
+
+            // Booking-linked invoices retain their complete audit history permanently.
+            const deleteLogsBtn = document.getElementById('deleteSelectedInvoiceLogsBtn');
+            if (deleteLogsBtn) deleteLogsBtn.classList.toggle('hidden', isBookingLinkedInvoice(inv));
 
             // Render Field-by-Field Change Logs with Actor/Role, Timestamp, Field, Old & New Values
             const logs = parseLogsSafe(inv.logsJson);
@@ -1703,6 +1778,7 @@ ${required}`);
             if (!inv) return;
             currentInvoiceDocId = inv.docId;
             currentInvoiceStatus = inv.status || 'Draft';
+            currentInvoiceBookingLinked = isBookingLinkedInvoice(inv);
 
             document.getElementById('invoiceNumber').textContent = inv.invoiceNumber || '';
             document.getElementById('invoiceDate').textContent = inv.issueDate || '';

@@ -291,6 +291,7 @@
                                             <td class="py-1 text-slate-600 font-semibold">Invoice No:</td>
                                             <td class="py-1 text-right font-extrabold text-[#071326]">
                                                 <span id="invoiceNumber" data-field="Invoice Number" contenteditable="true"></span>
+                                                <button id="allocateInvoiceNumberBtn" type="button" onclick="allocateConfirmedBookingInvoiceNumber()" class="ml-2 px-2 py-1 rounded bg-amber-500 text-[#071326] text-[10px] font-bold">Allocate Number (Confirmed Booking)</button>
                                             </td>
                                         </tr>
                                         <tr>
@@ -807,9 +808,10 @@
 
             const bookingRefValue = getTxt('bookingRef');
             if (bookingRefValue) currentInvoiceBookingLinked = true;
-            const invNum = getTxt('invoiceNumber') || currentInvoiceDocId;
-            // Sanitize document ID
-            const safeDocId = invNum.replace(/[^a-zA-Z0-9_-]/g, '_') || 'KDM_INV_DEFAULT';
+            const invNum = getTxt('invoiceNumber');
+            // Keep unnumbered drafts under their temporary draft ID; invoice numbers are allocated separately.
+            const docKey = currentInvoiceDocId || invNum || ('DRAFT-' + Date.now());
+            const safeDocId = docKey.replace(/[^a-zA-Z0-9_-]/g, '_') || 'KDM_INV_DEFAULT';
             currentInvoiceDocId = safeDocId;
 
             return {
@@ -1088,21 +1090,16 @@
         window.createNewClientInvoice = async function() {
             if (!db || !currentUser || currentUser.isAnonymous) { showToast('Please sign in as administrator first.'); return; }
             try {
-                const counterRef = doc(db, 'artifacts', appId, 'public', 'data', 'kdm_invoices', '__counter_2026');
-                const n = await runTransaction(db, async (tx) => {
-                    const snap = await tx.get(counterRef);
-                    const next = (snap.exists() ? Number(snap.data().lastNumber || 0) : 0) + 1;
-                    tx.set(counterRef, { lastNumber: next, updatedAt: new Date().toISOString() }, { merge: true });
-                    return next;
-                });
-                const invoiceNo = `KDM-INV-2026-${String(n).padStart(3,'0')}`;
-                currentInvoiceDocId = invoiceNo; currentInvoiceStatus = 'Draft'; currentInvoiceBookingLinked = false; vatEnabled = false;
-                sessionLogs = [{ id:'log_new_'+Date.now(), actor:'Administrator', timestamp:nowTimestamp(), field:'Invoice Created', oldValue:'(none)', newValue:invoiceNo, reviewed:true }];
+                // A new invoice starts as an unnumbered draft. Drafts never consume the counter.
+                const draftId = `DRAFT-${Date.now()}`;
+                currentInvoiceDocId = draftId; currentInvoiceStatus = 'Draft'; currentInvoiceBookingLinked = false; vatEnabled = false;
+                sessionLogs = [{ id:'log_new_'+Date.now(), actor:'Administrator', timestamp:nowTimestamp(), field:'Draft Created', oldValue:'(none)', newValue:'Unnumbered draft', reviewed:true }];
                 shuttleItems = [{ id:Date.now(), description:'Shuttle service', qty:1, rate:0 }];
                 const today = new Date(), due = new Date(today); due.setDate(due.getDate()+7);
                 const fmt = d => d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});
-                document.getElementById('invoiceNumber').textContent=invoiceNo;
-                document.getElementById('bankPaymentRef').textContent=invoiceNo;
+                document.getElementById('invoiceNumber').textContent='';
+                document.getElementById('allocateInvoiceNumberBtn').classList.remove('hidden');
+                document.getElementById('bankPaymentRef').textContent='';
                 document.getElementById('invoiceDate').textContent=fmt(today);
                 document.getElementById('invoiceDueDate').textContent=fmt(due);
                 document.getElementById('bookingRef').textContent='';
@@ -1113,14 +1110,46 @@
                 document.getElementById('vatLabel').textContent='VAT 15%: OFF';
                 document.getElementById('vatNumContainer').classList.add('hidden');
                 document.getElementById('vatSummaryRow').classList.add('hidden');
-                document.getElementById('invoiceDocHeading').textContent='INVOICE';
-                document.getElementById('invoiceDocSubheading').textContent='Invoice (No VAT Added) • South African Rand (ZAR)';
+                document.getElementById('invoiceDocHeading').textContent='INVOICE DRAFT';
+                document.getElementById('invoiceDocSubheading').textContent='Unnumbered Draft • Number allocated only for a confirmed booking';
                 renderShuttleItems();
                 document.getElementById('adminPortalView').classList.add('hidden');
                 document.getElementById('clientPortalView').classList.remove('hidden');
-                await syncInvoiceSnapshotToCloud('New Invoice Created');
-                showToast(`Started ${invoiceNo}`);
-            } catch (err) { console.error('Invoice allocation failed:',err); showToast('Could not create invoice. Check connection and try again.'); }
+                await syncInvoiceSnapshotToCloud('New Unnumbered Draft Created');
+                showToast('Unnumbered draft created. No invoice number has been used.');
+            } catch (err) { console.error('Draft creation failed:',err); showToast('Could not create draft. Check connection and try again.'); }
+        };
+
+        window.allocateConfirmedBookingInvoiceNumber = async function() {
+            if (!db || !currentUser || currentUser.isAnonymous) { showToast('Please sign in as administrator first.'); return; }
+            const bookingRefValue = (document.getElementById('bookingRef')?.innerText || '').trim();
+            if (!bookingRefValue) { showToast('Enter the booking reference first. Only allocate a number for a confirmed booking.'); return; }
+            if ((document.getElementById('invoiceNumber')?.innerText || '').trim()) { showToast('This invoice already has a number.'); return; }
+            if (!confirm(`Allocate the next permanent invoice number to confirmed booking ${bookingRefValue}? This number will not be reused.`)) return;
+            try {
+                const oldDraftId = currentInvoiceDocId;
+                const counterRef = doc(db, 'artifacts', appId, 'public', 'data', 'kdm_invoices', '__counter_2026');
+                const n = await runTransaction(db, async (tx) => {
+                    const snap = await tx.get(counterRef);
+                    const next = (snap.exists() ? Number(snap.data().lastNumber || 0) : 0) + 1;
+                    tx.set(counterRef, { lastNumber: next, updatedAt: new Date().toISOString() }, { merge: true });
+                    return next;
+                });
+                const invoiceNo = `KDM-INV-2026-${String(n).padStart(3,'0')}`;
+                document.getElementById('invoiceNumber').textContent = invoiceNo;
+                document.getElementById('bankPaymentRef').textContent = invoiceNo;
+                document.getElementById('allocateInvoiceNumberBtn').classList.add('hidden');
+                document.getElementById('invoiceDocHeading').textContent = 'INVOICE';
+                document.getElementById('invoiceDocSubheading').textContent = 'Invoice (No VAT Added) • South African Rand (ZAR)';
+                currentInvoiceDocId = invoiceNo;
+                currentInvoiceBookingLinked = true;
+                sessionLogs.unshift({ id:'log_allocate_'+Date.now(), actor:'Administrator', timestamp:nowTimestamp(), field:'Invoice Number Allocated', oldValue:'Unnumbered draft', newValue:invoiceNo, reviewed:true });
+                await syncInvoiceSnapshotToCloud('Number Allocated to Confirmed Booking');
+                if (oldDraftId && oldDraftId !== invoiceNo) {
+                    try { await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'kdm_invoices', oldDraftId)); } catch (cleanupErr) { console.warn('Draft document cleanup skipped:', cleanupErr); }
+                }
+                showToast(`${invoiceNo} allocated to confirmed booking ${bookingRefValue}.`);
+            } catch (err) { console.error('Invoice number allocation failed:',err); showToast('Could not allocate invoice number. Check connection and try again.'); }
         };
 
         window.handleClientPrintPdf = function() {
@@ -1781,6 +1810,7 @@ ${required}`);
             currentInvoiceBookingLinked = isBookingLinkedInvoice(inv);
 
             document.getElementById('invoiceNumber').textContent = inv.invoiceNumber || '';
+            document.getElementById('allocateInvoiceNumberBtn').classList.toggle('hidden', !!(inv.invoiceNumber || '').trim());
             document.getElementById('invoiceDate').textContent = inv.issueDate || '';
             document.getElementById('invoiceDueDate').textContent = inv.dueDate || '';
             document.getElementById('bookingRef').textContent = inv.bookingRef || '';

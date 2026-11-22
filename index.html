@@ -639,7 +639,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
         import { getAuth, signInAnonymously, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
-        import { getFirestore, doc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyDDAVHMNk7Ly3P2uX8K-oL-QY0bm8MdZr0",
@@ -650,7 +650,6 @@
             appId: "1:190115543206:web:a5d96a0692c3e453c5dc67"
         };
         const WHATSAPP_NUMBER = "27676029866";
-        const STATUS_LOOKUP_ENDPOINT = "https://us-central1-kdm-royal-shuttle.cloudfunctions.net/lookupBookingStatus";
 
         let db = null;
         let auth = null;
@@ -823,6 +822,12 @@
             }
         };
 
+        function normalizePhoneNumber(value) {
+            let digits = String(value || '').replace(/\D/g, '');
+            if (digits.startsWith('27')) digits = '0' + digits.slice(2);
+            return digits;
+        }
+
         window.lookupCustomerBookingStatus = async function(event) {
             event.preventDefault();
             const ref = document.getElementById('lookupBookingRef').value.trim().toUpperCase();
@@ -834,21 +839,26 @@
             result.textContent = 'Checking your booking…';
             btn.disabled = true; btn.textContent = 'Checking…';
             try {
-                if (!STATUS_LOOKUP_ENDPOINT || STATUS_LOOKUP_ENDPOINT.includes('REPLACE_ME')) throw new Error('not-configured');
-                const response = await fetch(STATUS_LOOKUP_ENDPOINT, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ bookingRef: ref, phone })
-                });
-                const data = await response.json().catch(() => ({}));
-                if (!response.ok || !data.ok) throw new Error(data.message || 'No matching booking was found. Check the reference and phone number.');
+                if (!db || !auth) throw new Error('The booking system is still connecting. Please try again in a moment.');
+                if (!currentUser) throw new Error('Your secure browser session is not ready. Refresh this page and try again.');
+                if (!currentUser.isAnonymous) throw new Error('Please check your booking from the customer booking page, not the admin session.');
+                if (!ref || !phone) throw new Error('Enter your booking reference and the phone number used when booking.');
+
+                const bookingDoc = doc(db, 'artifacts', appId, 'public', 'data', 'kdm_bookings', ref);
+                const bookingSnap = await getDoc(bookingDoc);
+                if (!bookingSnap.exists()) throw new Error('No booking was found. Check your reference and try again.');
+
+                const data = bookingSnap.data();
+                if (data.ownerUid !== currentUser.uid || normalizePhoneNumber(data.passengerPhone) !== normalizePhoneNumber(phone)) {
+                    throw new Error('Booking not found for this browser session and phone number. Please use the same phone and browser used to submit the booking.');
+                }
+
                 result.className = 'mt-3 rounded-xl border p-3 text-sm bg-emerald-50 border-emerald-200 text-slate-800';
                 const reason = data.statusReason ? `<div class="mt-2"><strong>Update from KDM:</strong> ${escapeHtml(data.statusReason)}</div>` : '';
                 result.innerHTML = `<div class="font-extrabold text-[#0f1e36]">${escapeHtml(data.bookingRef)}</div><div class="mt-1">Current status: <strong>${escapeHtml(data.status)}</strong></div>${reason}<div class="mt-2 text-xs text-slate-500">Last updated: ${escapeHtml(data.statusUpdatedAt || 'Not available')}</div>`;
             } catch (err) {
                 result.className = 'mt-3 rounded-xl border p-3 text-sm bg-amber-50 border-amber-200 text-amber-900';
-                result.textContent = err.message === 'not-configured'
-                    ? 'The secure status service has not been deployed yet. Please contact KDM Royal Shuttle on WhatsApp +27 67 602 9866.'
-                    : (err.message || 'Unable to check the booking right now. Please try again later.');
+                result.textContent = err.message || 'Unable to check the booking right now. Please try again later.';
             } finally { btn.disabled = false; btn.textContent = 'Check Booking Status'; }
         };
 
@@ -896,6 +906,7 @@
 
             const bookingRecord = {
                 bookingRef,
+                ownerUid: currentUser.uid,
                 serviceType: selectedService,
                 tripType: selectedTripType,
                 pickupLocation,
@@ -1277,7 +1288,7 @@
                     </div>
                     ${bk.statusReason ? `<div class="bg-rose-50 border border-rose-200 rounded-lg p-3 text-xs"><strong>Customer-facing status reason:</strong> ${escapeHtml(bk.statusReason)}</div>` : ''}
 
-                    ${bk.status === 'Confirmed' ? `<a href="KDM_Royal_Shuttle_Invoice_Firebase.html?bookingRef=${encodeURIComponent(bk.bookingRef)}" target="_blank" rel="noopener noreferrer" class="inline-flex w-full items-center justify-center rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-3 text-sm font-extrabold">Create Invoice from This Confirmed Booking</a>` : `<div class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">An invoice can be started from this booking once its status is Confirmed.</div>`}
+                    ${bk.status === 'Confirmed' ? `<a href="KDM_Royal_Shuttle_Invoice_Firebase.html?bookingRef=${encodeURIComponent(bk.bookingRef)}" target="_blank" rel="noopener noreferrer" class="inline-flex w-full items-center justify-center rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white px-4 py-3 text-sm font-extrabold">Create Invoice from This Confirmed Booking</a>` : ''}
 
                     <!-- Status Controls & Admin Dispatch Notes -->
                     <div class="grid grid-cols-1 sm:grid-cols-12 gap-3 pt-1">
@@ -1353,7 +1364,10 @@
             logs.unshift({ timestamp: nowTimestamp(), actor: 'Admin / VA Dispatch', action: 'Updated Booking Status', details: `${oldStatus} -> ${newStatus}${reason ? ` | Customer reason: ${reason}` : ''}` });
             bk.auditJson = JSON.stringify(logs);
             const saved = await saveBookingToCloud(bk);
-            if (saved) showToast(`Status updated to ${newStatus}`);
+            if (saved) {
+                window.setStatusFilter(newStatus);
+                showToast(`Booking moved to ${newStatus}`);
+            }
         };
 
         window.saveSelectedBookingAdminNote = async function() {
